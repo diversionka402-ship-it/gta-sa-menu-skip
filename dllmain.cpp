@@ -5,7 +5,7 @@
 constexpr uintptr_t ADDR_FRONTEND_MENU_MANAGER = 0xBA6748;
 constexpr uintptr_t ADDR_PROCESS_MENU_OPTIONS  = 0x576FE0;
 
-// Смещения полей внутри CMenuManager (см. VALIDATE_OFFSET в исходном CMenuManager.h)
+// Смещения полей внутри CMenuManager
 constexpr int OFFSET_CURRENT_MENU_ENTRY = 0x54;  // int  m_nCurrentMenuEntry
 constexpr int OFFSET_MENU_ACTIVE        = 0x5C;  // bool m_bMenuActive
 constexpr int OFFSET_CURRENT_MENU_PAGE  = 0x15D; // char m_nCurrentMenuPage
@@ -24,33 +24,26 @@ static DWORD WINAPI MainThread(LPVOID) {
     BYTE* mm = reinterpret_cast<BYTE*>(ADDR_FRONTEND_MENU_MANAGER);
     auto processMenuOptions = reinterpret_cast<ProcessMenuOptions_t>(ADDR_PROCESS_MENU_OPTIONS);
 
-    // Ждём, пока меню РЕАЛЬНО не станет активным (после заставок/логотипов)
-    for (int i = 0; i < 300; ++i) {
-        if (*reinterpret_cast<bool*>(mm + OFFSET_MENU_ACTIVE)) {
-            break;
-        }
-        Sleep(100);
-    }
-    Sleep(300); // буфер, чтобы меню успело отрисовать первый кадр
+    // Максимальный приоритет потока — чтобы среагировать раньше,
+    // чем движок успеет отрисовать (Present) хотя бы один кадр меню.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-    // Первый шаг: принудительно ставим главную страницу и жмём Enter на первом пункте
-    // (Main Menu -> Start Game)
+    // БЕЗ Sleep вообще. Крутимся на максимальной скорости процессора,
+    // проверяя флаг каждую итерацию, пока игра сама не выставит его в true.
+    // Это окно (от установки флага до первого Present()) занимает миллисекунды —
+    // busy-wait успевает среагировать внутри него, Sleep(даже 1мс) — не успевает
+    // из-за задержки планировщика потоков Windows.
+    while (!*reinterpret_cast<volatile bool*>(mm + OFFSET_MENU_ACTIVE)) {
+        // намеренно пусто — activewait
+    }
+
     *reinterpret_cast<char*>(mm + OFFSET_CURRENT_MENU_PAGE) = MENUPAGE_MAIN_MENU;
+
+    // Шаг 1: Main Menu -> "Start Game" -> открывает подменю Game
     PressEnterOnFirstEntry(mm, processMenuOptions);
 
-    // Дальше идёт цепочка экранов: Game -> New Game -> "Are you sure?" -> ... -> геймплей.
-    // Просто продолжаем жать Enter на первом пункте каждого следующего экрана,
-    // пока меню не закроется целиком (m_bMenuActive == false = игра реально началась).
-    for (int step = 0; step < 20; ++step) {
-        Sleep(500);
-
-        bool menuActive = *reinterpret_cast<bool*>(mm + OFFSET_MENU_ACTIVE);
-        if (!menuActive) {
-            break; // меню закрылось — игра началась, дальше делать нечего
-        }
-
-        PressEnterOnFirstEntry(mm, processMenuOptions);
-    }
+    // Шаг 2: сразу же, без единой паузы, Game -> "New Game" -> запускает загрузку
+    PressEnterOnFirstEntry(mm, processMenuOptions);
 
     return 0;
 }
