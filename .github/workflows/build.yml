@@ -1,0 +1,29 @@
+name: Build DLL
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (Win32 / x86)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build (Release)
+        run: cmake --build build --config Release
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: menuskip-dll
+          path: build/Release/menuskip.dll
+          if-no-files-found: error
