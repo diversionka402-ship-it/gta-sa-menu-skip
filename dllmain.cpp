@@ -1,13 +1,12 @@
 #include <windows.h>
 #include <cstdint>
-#include <MinHook.h>
 
 // Адреса подтверждены для GTA SA 1.0 US (plugin-sdk и modloader независимо совпадают)
 constexpr uintptr_t ADDR_FRONTEND_MENU_MANAGER = 0xBA6748;
 constexpr uintptr_t ADDR_PROCESS_MENU_OPTIONS  = 0x576FE0;
-constexpr uintptr_t ADDR_MENU_PROCESS          = 0x57B440; // CMenuManager::Process()
 
-// Смещения полей внутри CMenuManager
+// Смещения полей внутри CMenuManager (см. VALIDATE_OFFSET в исходном CMenuManager.h)
+constexpr int OFFSET_SHUTDOWN_REQUESTED = 0x32;  // bool m_bShutDownFrontEndRequested
 constexpr int OFFSET_CURRENT_MENU_ENTRY = 0x54;  // int  m_nCurrentMenuEntry
 constexpr int OFFSET_MENU_ACTIVE        = 0x5C;  // bool m_bMenuActive
 constexpr int OFFSET_CURRENT_MENU_PAGE  = 0x15D; // char m_nCurrentMenuPage
@@ -16,65 +15,45 @@ constexpr char MENUPAGE_MAIN_MENU = 34;
 
 using ProcessMenuOptions_t = void(__thiscall*)(void* thisPtr, char input, char* exitFlag, char enter);
 
-// Хак для хука __thiscall-метода: __fastcall кладёт первый аргумент в ECX,
-// точно так же, как __thiscall кладёт this. EDX не используется.
-using Process_t = int(__fastcall*)(void* thisPtr, void* /*unused edx*/);
-
-static Process_t oProcess = nullptr;
-static bool g_skipDone = false; // чтобы сработать РОВНО один раз за весь процесс
-
 static void PressEnterOnFirstEntry(BYTE* mm, ProcessMenuOptions_t processMenuOptions) {
     *reinterpret_cast<int*>(mm + OFFSET_CURRENT_MENU_ENTRY) = 0;
     char exitFlag = 0;
     processMenuOptions(mm, 0, &exitFlag, 1);
 }
 
-static int __fastcall hkProcess(void* thisPtr, void* /*edx*/) {
-    if (!g_skipDone) {
-        BYTE* mm = reinterpret_cast<BYTE*>(thisPtr);
-        bool menuActive = *reinterpret_cast<bool*>(mm + OFFSET_MENU_ACTIVE);
+static DWORD WINAPI MainThread(LPVOID) {
+    BYTE* mm = reinterpret_cast<BYTE*>(ADDR_FRONTEND_MENU_MANAGER);
+    auto processMenuOptions = reinterpret_cast<ProcessMenuOptions_t>(ADDR_PROCESS_MENU_OPTIONS);
 
-        // Ждём естественного момента, когда игра САМА готова показать меню
-        // (то есть уже прошли заставки и все нужные системы инициализированы) —
-        // именно в этот момент, а не раньше.
-        if (menuActive) {
-            g_skipDone = true; // больше никогда не вмешиваемся
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-            auto processMenuOptions = reinterpret_cast<ProcessMenuOptions_t>(ADDR_PROCESS_MENU_OPTIONS);
-
-            *reinterpret_cast<char*>(mm + OFFSET_CURRENT_MENU_PAGE) = MENUPAGE_MAIN_MENU;
-
-            // Main Menu -> "Start Game" -> открывает подменю Game
-            PressEnterOnFirstEntry(mm, processMenuOptions);
-            // Game -> "New Game" -> запускает загрузку
-            PressEnterOnFirstEntry(mm, processMenuOptions);
-        }
+    // Ждём, пока игра САМА выставит m_bMenuActive = true — это естественный
+    // момент, когда все нужные системы (стриминг, ресурсы) уже готовы.
+    while (!*reinterpret_cast<volatile bool*>(mm + OFFSET_MENU_ACTIVE)) {
+        // busy-wait, намеренно без Sleep
     }
 
-    // Отдаём управление оригинальной функции — этот же кадр обработается
-    // уже с нашим подменённым состоянием (если сработало выше), либо
-    // полностью прозрачно, как обычно (если уже отработали один раз).
-    return oProcess(thisPtr, nullptr);
-}
+    *reinterpret_cast<char*>(mm + OFFSET_CURRENT_MENU_PAGE) = MENUPAGE_MAIN_MENU;
 
-static void InstallHook() {
-    if (MH_Initialize() != MH_OK) {
-        return;
-    }
+    // Main Menu -> "Start Game" -> открывает подменю Game
+    PressEnterOnFirstEntry(mm, processMenuOptions);
 
-    void* target = reinterpret_cast<void*>(ADDR_MENU_PROCESS);
-    if (MH_CreateHook(target, reinterpret_cast<void*>(&hkProcess),
-                       reinterpret_cast<void**>(&oProcess)) != MH_OK) {
-        return;
-    }
+    // Game -> "New Game" -> запускает загрузку
+    PressEnterOnFirstEntry(mm, processMenuOptions);
 
-    MH_EnableHook(target);
+    // ВАЖНО: именно это игра обычно делает сама после выбора New Game —
+    // просит фронтенд корректно закрыться. Без этого шага меню считает,
+    // что должно оставаться "полуактивным", и после загрузки всплывает
+    // призрачная пауза с чёрным экраном.
+    *reinterpret_cast<bool*>(mm + OFFSET_SHUTDOWN_REQUESTED) = true;
+
+    return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        InstallHook(); // без потоков, без Sleep — хук сам сработает в нужный момент
+        CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
     }
     return TRUE;
 }
